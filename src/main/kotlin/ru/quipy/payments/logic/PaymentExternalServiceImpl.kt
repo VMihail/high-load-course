@@ -49,6 +49,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val executor = Executors.newCachedThreadPool()
     private val scheduler = Executors.newScheduledThreadPool(1)
+    private val pool = Executors.newFixedThreadPool(parallelRequests)
 
     private val client = OkHttpClient.Builder().build()
 
@@ -57,7 +58,12 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
+        pool.submit {
+            processPayment(paymentId, transactionId, paymentStartedAt, amount, deadline)
+        }
+    }
 
+    private fun processPayment(paymentId: UUID, transactionId: UUID, paymentStartedAt: Long, amount: Int, deadline: Long) {
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
