@@ -54,91 +54,80 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
+
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        fun attemptRequest(attempt: Int) {
-            if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                }
-                return
-            }
-
-            if (!semaphore.tryAcquire()) {
-                logger.warn("[$accountName] Too many concurrent requests")
-                return
-            }
-
-            if (!rateLimiter.tick()) {
-                logger.warn("[$accountName] Sliding window rate limit")
-                semaphore.release()
-                return
-            }
-
-            if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
-                logger.warn("[$accountName] Ongoing window full")
-                semaphore.release()
-                return
-            }
-
-            if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
-                logger.warn("[$accountName] Ongoing window full")
-                semaphore.release()
-                return
-            }
-
-            val request = HttpRequest.newBuilder()
-                .uri(URI("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
-                .version(HttpClient.Version.HTTP_2)
-                .POST(HttpRequest.BodyPublishers.noBody())
-                .timeout(Duration.ofMillis(deadline - now()))
-                .build()
-
-            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                .orTimeout(deadline - now(), TimeUnit.MILLISECONDS)
-                .thenAcceptAsync { response ->
-                    try {
-                        val body = try {
-                            mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Failed to parse response for txId: $transactionId, payment: $paymentId, code: ${response.statusCode()}")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                        }
-
-                        logger.info("[$accountName] Response for txId: $transactionId, payment: $paymentId: ${body.result}, message: ${body.message}")
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                        }
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Unexpected error processing response", e)
-                    }
-                }
-                .exceptionally { ex ->
-                    if (attempt < retryProperties.count) {
-                        logger.warn("[$accountName] Retrying paymentId=$paymentId attempt=$attempt due to ${ex.message}")
-                        attemptRequest(attempt + 1)
-                    } else {
-                        logger.error("[$accountName] Payment failed for paymentId=$paymentId after $attempt attempts", ex)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = ex.message)
-                        }
-                    }
-                    null
-                }
-                .whenComplete { _, _ ->
-                    semaphore.release()
-                    ongoingWindow.releaseWindow()
-                }
-
-            attemptRequest(1)
-        }
+        attemptRequest(1, paymentId, amount, transactionId, deadline)
     }
 
-    private fun isDeadlined(deadline: Long): Boolean = LocalDateTime.now().isAfter(
-        Instant.ofEpochMilli(deadline).atZone(ZoneId.systemDefault()).toLocalDateTime()
-    )
+    fun attemptRequest(attempt: Int, paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long) {
+        if (now() + requestAverageProcessingTime.toMillis() >= deadline) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+            }
+            return
+        }
+
+        if (!semaphore.tryAcquire()) {
+            logger.warn("[$accountName] Too many concurrent requests")
+            return
+        }
+
+        if (!rateLimiter.tick()) {
+            logger.warn("[$accountName] Sliding window rate limit")
+            semaphore.release()
+            return
+        }
+
+        if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
+            logger.warn("[$accountName] Ongoing window full")
+            semaphore.release()
+            return
+        }
+
+        val request = HttpRequest.newBuilder()
+            .uri(URI("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+            .version(HttpClient.Version.HTTP_2)
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .timeout(Duration.ofMillis(deadline - now()))
+            .build()
+
+        client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            .orTimeout(deadline - now(), TimeUnit.MILLISECONDS)
+            .thenAcceptAsync { response ->
+                try {
+                    val body = try {
+                        mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Failed to parse response for txId: $transactionId, payment: $paymentId, code: ${response.statusCode()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    }
+
+                    logger.info("[$accountName] Response for txId: $transactionId, payment: $paymentId: ${body.result}, message: ${body.message}")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    }
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Unexpected error processing response", e)
+                }
+            }.exceptionally { ex ->
+                if (attempt < retryProperties.count) {
+                    logger.warn("[$accountName] Retrying paymentId=$paymentId attempt=$attempt due to ${ex.message}")
+                    attemptRequest(attempt + 1, paymentId, amount, transactionId, deadline)
+                } else {
+                    logger.error("[$accountName] Payment failed for paymentId=$paymentId after $attempt attempts", ex)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = ex.message)
+                    }
+                }
+                null
+            }.whenComplete { _, _ ->
+                semaphore.release()
+                ongoingWindow.releaseWindow()
+            }
+    }
 
     override fun price() = properties.price
 
